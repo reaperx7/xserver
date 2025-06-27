@@ -1,0 +1,148 @@
+--- a/hw/xfree86/common/xf86Option.c
++++ b/hw/xfree86/common/xf86Option.c
+@@ -50,6 +50,7 @@
+ #include "xf86.h"
+ #include "xf86Optrec.h"
+ #include "xf86Option.h"
++#include "xf86Priv.h"
+
+ static OptionInfoRec *AvailableOptions(int chipid, int bustype);
+
+@@ -150,6 +151,10 @@ xf86CollectOptions(ScrnInfoPtr pScrn, XF86OptionPtr options)
+         if (!strcasecmp(opt->name, "Accel"))
+             pScrn->accel = xf86BoolOption(opt->value);
++        if (!strcasecmp(opt->name, "HDR10_Enable")) {
++            pScrn->hdr10Enable = xf86BoolOption(opt->value);
++            xf86Msg(X_CONFIG, "HDR10_Enable set to %s\n", pScrn->hdr10Enable ? "on" : "off");
++        }
+     }
+ }
+
+@@ -200,6 +205,7 @@ xf86InitOptions(ScrnInfoPtr pScrn)
+     pScrn->monitor = NULL;
+     pScrn->accel = TRUE;
++    pScrn->hdr10Enable = FALSE;
+ }
+
+ --- a/hw/xfree86/common/xf86Edid.c
++++ b/hw/xfree86/common/xf86Edid.c
+@@ -500,6 +500,30 @@ xf86ParseEDID(ScrnInfoPtr pScrn, unsigned char *edid)
+     pScrn->monitor->widthmm = edid[21];
+     pScrn->monitor->heightmm = edid[22];
++    /* Check for HDR10 support in EDID CTA-861 extension */
++    if (edid[0x80] == 0x02) { /* CTA-861 extension block */
++        int cta_len = edid[0x81];
++        int i;
++        for (i = 4; i < cta_len; i += (edid[i] & 0x1F) + 1) {
++            if ((edid[i] & 0xE0) == 0x40) { /* Video Data Block */
++                /* Check for HDR10 static metadata */
++                if (edid[i + 1] & 0x01) { /* Supports HDR10 */
++                    pScrn->hdr10Supported = TRUE;
++                    pScrn->maxBrightness = edid[i + 2] * 50; /* Max luminance in nits */
++                    pScrn->colorPrimaries = 0x01; /* BT.2020 */
++                    pScrn->eotf = 0x02; /* ST 2084 */
++                    xf86Msg(X_INFO, "Monitor supports HDR10: Max %d nits, BT.2020, ST 2084\n",
++                            pScrn->maxBrightness);
++                }
++            }
++        }
++    } else {
++        pScrn->hdr10Supported = FALSE;
++        pScrn->maxBrightness = 0;
++        pScrn->colorPrimaries = 0;
++        pScrn->eotf = 0;
++    }
+ }
+-------------------------------------
+ --- a/hw/xfree86/common/xf86Crtc.c
++++ b/hw/xfree86/common/xf86Crtc.c
+@@ -1000,6 +1000,24 @@ xf86CrtcConfigInit(ScrnInfoPtr scrn)
+         config->crtc[i]->enabled = FALSE;
+     }
++    /* Configure HDR10 if enabled and supported */
++    if (scrn->hdr10Enable && scrn->hdr10Supported) {
++        scrn->bitsPerPixel = 30; /* 10-bit per channel */
++        scrn->depth = 30;
++        /* Set up HDR metadata for driver */
++        scrn->hdrMetadata = malloc(sizeof(HDRMetadata));
++        HDRMetadata *meta = (HDRMetadata *)scrn->hdrMetadata;
++        meta->maxLuminance = scrn->maxBrightness;
++        meta->colorPrimaries = scrn->colorPrimaries;
++        meta->eotf = scrn->eotf;
++        xf86Msg(X_INFO, "Configuring HDR10: %d nits, color primaries %d, EOTF %d\n",
++                meta->maxLuminance, meta->colorPrimaries, meta->eotf);
++        /* Notify driver to enable HDR10 pipeline */
++        if (scrn->driverFunc) {
++            scrn->driverFunc(scrn, XF86_ENABLE_HDR10, scrn->hdrMetadata);
++        }
++    }
+ }
+-------------------------------
+create new file hw/xfree86/common/xf86HDR.h
+
+
+
+
+ #ifndef _XF86HDR_H_
+#define _XF86HDR_H_
+
+typedef struct {
+    int maxLuminance; /* In nits */
+    int colorPrimaries; /* 0x01 = BT.2020 */
+    int eotf; /* 0x02 = ST 2084 */
+} HDRMetadata;
+
+#define XF86_ENABLE_HDR10 1001 /* Custom driver function code */
+
+#endif
+
+---------------------------------
+
+--- a/hw/xfree86/drivers/modesetting/modesetting.c
++++ b/hw/xfree86/drivers/modesetting/modesetting.c
+@@ -500,6 +500,18 @@ modesettingDriverFunc(ScrnInfoPtr scrn, XF86DriverFuncOp op, void *data)
+         return TRUE;
+     }
++    case XF86_ENABLE_HDR10:
++        if (scrn->hdr10Supported) {
++            HDRMetadata *meta = (HDRMetadata *)data;
++            /* Example: Pass metadata to DRM/KMS */
++            drmModePropertySet(scrn->fd, scrn->crtc_id, "HDR_METADATA",
++                               meta->maxLuminance, meta->colorPrimaries, meta->eotf);
++            xf86Msg(X_INFO, "Driver: Enabled HDR10 with max %d nits\n",
++                    meta->maxLuminance);
++            return TRUE;
++        }
++        return FALSE;
+ }
+
+ -------------------------------------
+
+ --- a/glx/glxext.c
++++ b/glx/glxext.c
+@@ -300,6 +300,12 @@ glxInitExtensions(ScreenPtr pScreen, ScrnInfoPtr pScrn)
+         LogMessage(X_INFO, "GLX: Initialized GLX_MESA_swap_control\n");
+     }
++    if (pScrn->hdr10Enable && pScrn->hdr10Supported) {
++        __glXEnableExtension(pScreen, "GLX_EXT_hdr_metadata");
++        LogMessage(X_INFO, "GLX: Initialized GLX_EXT_hdr_metadata for HDR10\n");
++        /* Register HDR metadata callback for applications */
++        glXSetHDRMetadata(pScrn->hdrMetadata);
++    }
+ }
+
+-----------------------------------------
+
+Section "Screen"
+    Identifier "Screen0"
+    Device "Device0"
+    Monitor "Monitor0"
+    DefaultDepth 30
+    Option "HDR10_Enable" "on"
+    SubSection "Display"
+        Depth 30
+    EndSubSection
+EndSection
+
+-----------------------------------------
+
